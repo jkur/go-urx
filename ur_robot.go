@@ -2,15 +2,14 @@ package urx
 
 import (
 	//"bufio"
-	"encoding/binary"
 	"fmt"
 	"github.com/lunixbochs/struc"
 	"gonum.org/v1/gonum/mat"
-	//	"io"
 	"net"
 	"os"
 	//	"time"
 	"bytes"
+	"encoding/binary"
 )
 
 type urRobot struct {
@@ -20,42 +19,40 @@ type urRobot struct {
 }
 
 type netPackage struct {
-	len  uint32
+	len  int
 	data []byte
 }
 
-type RobotModeData struct {
-	Length                   uint32  `struc:"uint32,big"`
-	Ptype                    int     `struc:"uint8"`
-	Timestamp                uint64  `struc:"uint64,big"`
-	PhysicalRobotConnected   bool    `struc:"bool"`
-	RealRobotEnabled         bool    `struc:"bool"`
-	RobotPowerOn             bool    `struc:"bool"`
-	EmergencyStopped         bool    `struc:"bool"`
-	ProtectiveStopped        bool    `struc:"bool"`
-	ProgramRunning           bool    `struc:"bool"`
-	ProgramPaused            bool    `struc:"bool"`
-	RobotMode                uint8   `struc:"uint8"`
-	ControlMode              uint8   `struc:"uint8"`
-	TargetSpeedFraction      float64 `struc:"float64"`
-	SpeedScaling             float64 `struc:"float64"`
-	TargetSpeedFractionLimit float64 `struc:"float64"`
-	Reserved                 uint8   `struc:"uint8"`
+type UrSecmonHeader struct {
+	Length      uint32 `struc:"uint32,big"`
+	MessageType uint8  `struc:"uint8"`
 }
 
-func (r *RobotModeData) String() string {
-	return fmt.Sprintf("RobotModeData (%d): PhysicalRobotConnected (%t), RealRobotEnabled (%t), RobotPowerOn (%t), EmergencyStopped (%t), ProtectiveStopped (%t), ProgrammRunning (%t), ProgramPaused (%t), RobotMode (%d), ControlMode (%d), SpeedScaling (%f)",
-		r.Timestamp, r.PhysicalRobotConnected, r.RealRobotEnabled, r.RobotPowerOn, r.EmergencyStopped, r.EmergencyStopped, r.ProgramRunning, r.ProgramPaused, r.RobotMode, r.ControlMode, r.TargetSpeedFraction)
+type UrSecmonPacket struct {
+	Header UrSecmonHeader
+	Data   []byte
 }
 
-type urMessage struct {
-	len   uint32
-	mtype byte
-	data  []byte
+type UrSubHeader struct {
+	Length      uint32 `struc:"uint32,big"`
+	MessageType uint8  `struc:"uint8"`
 }
 
-func (m urMessage) String() string {
-	return fmt.Sprintf("RobotMessage %d with length: %d", m.mtype, m.len)
+type UrSubPacket struct {
+	Header UrSubHeader
+	Data   []byte
+}
+
+func (s *UrSecmonPacket) String() string {
+	return fmt.Sprintf("UrSecmonPacket: Header (Length: %d, Type: %d) - len(Data) := %d", s.Header.Length, s.Header.MessageType, len(s.Data))
+}
+
+func (s *UrSubPacket) String() string {
+	return fmt.Sprintf("UrSubPacket: Header (Length: %d, Type: %d) - len(Data) := %d", s.Header.Length, s.Header.MessageType, len(s.Data))
+}
+
+func (n *netPackage) String() string {
+	return fmt.Sprintf("Net: len(%d), %x", n.len, n.data[:n.len])
 }
 
 func NewUR() *urRobot {
@@ -68,56 +65,183 @@ func (urrobot *urRobot) getl() *mat.VecDense {
 	return mat.NewVecDense(6, []float64{0, 0, 0, 0, 0, 0})
 }
 
-func listen(conn *net.TCPConn, c chan netPackage) {
+func listen(conn *net.TCPConn, c chan *netPackage) {
 	//timeoutDuration := 10 * time.Millisecond
 	//conn.SetReadDeadline(time.Now().Add(timeoutDuration))
+	buf := make([]byte, 2048)
 	for {
-		reply := new(netPackage)
-		reply.data = make([]byte, 2048)
-		size, err := conn.Read(reply.data)
+		reply := &netPackage{}
+		size, err := conn.Read(buf)
 		if err != nil {
 			println("Somthing failed at Read:", err.Error())
 		} else {
-			println("Readdind data:", size)
-			reply.len = uint32(size)
-			c <- *reply
+			//println("Reading data:", size)
+			reply.len = size
+			reply.data = make([]byte, reply.len)
+			copy(reply.data, buf)
+			c <- reply
 		}
 	}
 }
 
-func parseMessage(data *netPackage) {
-	// validity check
-	packet_length := binary.BigEndian.Uint32(data.data[0:4])
-	mtype := data.data[4]
-	if packet_length != data.len {
-		println("broken packet. aborting")
-		println("length: ", packet_length, data.len)
-	} else {
-		println("Message type: ", mtype)
+func parseUrSecmonPacket(data *netPackage) {
+	buf := bytes.NewReader(data.data)
+	urh := &UrSecmonHeader{}
+	err := struc.Unpack(buf, &urh)
+	if err != nil {
+		fmt.Println("Something went wrong at parsing secmon packet")
 	}
-	parseSubPackage(data.data[5:], uint32(len(data.data)-5))
+	if urh.MessageType != 16 {
+		fmt.Println("Bad packet: Message Type is not 16")
+	}
+	urp := &UrSecmonPacket{}
+	urp.Header = *urh
+	urp.Data = make([]byte, urh.Length-5)
+	err = binary.Read(buf, binary.BigEndian, &urp.Data)
+	if len(urp.Data) != int(urp.Header.Length-5) {
+		fmt.Println("Bad packet: Size mismatch")
+		return
+	}
+	fmt.Println(urp)
+	parseSubPackages(urp)
 }
 
-func parseSubPackage(data []byte, size uint32) {
-	if size > 5 {
-		packet_length := binary.BigEndian.Uint32(data[0:4])
-		mtype := data[4]
-		if packet_length > size {
-			println(" packet too long")
-		} else {
-			println("packet length", packet_length, len(data))
-			println("SubType:", mtype)
+func parseSubPackages(secmonpkg *UrSecmonPacket) {
+	buf := bytes.NewReader(secmonpkg.Data)
+	for buf.Len() > 5 {
+		urh := &UrSubHeader{}
+		err := struc.Unpack(buf, &urh)
+		if err != nil {
+			fmt.Println("Something went wrong at parsing subpacket")
 		}
-		if packet_length < size {
-			//parseSubPackage(data[packet_length:], size-packet_length)
-		}
-		if mtype == 0 {
+		switch ptype := urh.MessageType; ptype {
+		case ROBOTMODEDATA:
 			o := &RobotModeData{}
-			err := struc.Unpack(bytes.NewReader(data), o)
-			if err != nil {
-				println("struc error")
+			if buf.Len() < 47 {
+				println("Found Robotmode but buffer too small", buf.Len())
+				return
 			}
+			err := struc.Unpack(buf, o)
+			if err != nil {
+				println("struc error:", err.Error())
+			}
+			o.length = urh.Length
+			o.ptype = urh.MessageType
 			fmt.Println(o)
+		case JOINTDATA:
+			o := &JointDataContainer{}
+			if buf.Len() < 251 {
+				println("Found Joint Data but buffer too small", buf.Len())
+				return
+			}
+			err := struc.Unpack(buf, o)
+			if err != nil {
+				println("struc error:", err.Error())
+			}
+			o.length = urh.Length
+			o.ptype = urh.MessageType
+			fmt.Println(o)
+		case TOOLDATA:
+			o := &ToolData{}
+			if buf.Len() < 37 {
+				println("Found Tool Data but buffer too small", buf.Len())
+				return
+			}
+			err := struc.Unpack(buf, o)
+			if err != nil {
+				println("struc error:", err.Error())
+			}
+			o.length = urh.Length
+			o.ptype = urh.MessageType
+			fmt.Printf("Tooldata: %+v\n", o)
+		case MASTERBOARDDATA:
+			// First check length
+			if urh.Length == 90 {
+				o := &MasterboardDataEuromap{}
+				o.length = urh.Length
+				o.ptype = urh.MessageType
+				if buf.Len() < int(o.length) {
+					println("Found Masterboard Data but buffer too small", buf.Len())
+					return
+				}
+				err := struc.Unpack(buf, o)
+				if err != nil {
+					println("struc error:", err.Error())
+				}
+				fmt.Printf("Masterboard(Euromap): %+v\n", o)
+			} else if urh.Length == 74 {
+				o := &MasterboardData{}
+				o.length = urh.Length
+				o.ptype = urh.MessageType
+				if buf.Len() < int(o.length) {
+					println("Found Masterboard Data but buffer too small", buf.Len())
+					return
+				}
+				err := struc.Unpack(buf, o)
+				if err != nil {
+					println("struc error:", err.Error())
+				}
+				fmt.Printf("Masterboard: %+v\n", o)
+			}
+		case CARTESIANINFO:
+			o := &CartesianInfo{}
+			o.length = urh.Length
+			o.ptype = urh.MessageType
+			if buf.Len() < int(o.length) {
+				println("Found CartesianInfob but buffer too small", buf.Len())
+				return
+			}
+			err := struc.Unpack(buf, o)
+			if err != nil {
+				println("struc error:", err.Error())
+			}
+			fmt.Printf("CartesianInfo: %+v\n", o)
+		case CONFIGURATIONDATA:
+			o := &ConfigurationData{}
+			o.length = urh.Length
+			o.ptype = urh.MessageType
+			if buf.Len() < int(o.length) {
+				println("Found ConfigurationData but buffer too small", buf.Len())
+				return
+			}
+			err := struc.Unpack(buf, o)
+			if err != nil {
+				println("struc error:", err.Error())
+			}
+			fmt.Printf("ConfigurationData: %+v\n", o)
+		case ADDITIONALINFO:
+			o := &AdditionalInfo{}
+			o.length = urh.Length
+			o.ptype = urh.MessageType
+			if buf.Len() < int(o.length) {
+				println("Found AdditionalInfo but buffer too small", buf.Len())
+				return
+			}
+			err := struc.Unpack(buf, o)
+			if err != nil {
+				println("struc error:", err.Error())
+			}
+			fmt.Printf("AdditionalInfo: %+v\n", o)
+		case FORCEMODEDATA:
+			o := &ForceModeData{}
+			o.length = urh.Length
+			o.ptype = urh.MessageType
+			if buf.Len() < int(o.length) {
+				println("Found ForceModeData but buffer too small", buf.Len())
+				return
+			}
+			err := struc.Unpack(buf, o)
+			if err != nil {
+				println("struc error:", err.Error())
+			}
+			fmt.Printf("ForceModeData: %+v\n", o)
+
+		default:
+			fmt.Printf("Unrecognized Packet with type (%d) and Length: %d\n", urh.MessageType, urh.Length)
+			if int(urh.Length) < buf.Len() {
+				discard_buf := make([]byte, urh.Length-5)
+				buf.Read(discard_buf)
+			}
 		}
 	}
 }
@@ -137,11 +261,12 @@ func (urrobot *urRobot) Start(addr, port string) {
 			println("Dial failed:", err.Error())
 			os.Exit(1)
 		}
-		c := make(chan netPackage)
+		c := make(chan *netPackage)
 		go listen(conn, c)
 		for data := range c {
-			println(data.len, data.data)
-			parseMessage(&data)
+			//println(data.len, data.data)
+			parseUrSecmonPacket(data)
+			//fmt.Println(data)
 		}
 		conn.Close()
 	}
